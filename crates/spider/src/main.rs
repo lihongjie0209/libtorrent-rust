@@ -153,6 +153,8 @@ impl Metrics {
             let total_samples: u64 = worker_stats.iter().map(|(_, c)| c).sum();
             let avg_samples = total_samples as f64 / worker_stats.len() as f64;
             info!("  平均: {:.1} samples/worker", avg_samples);
+        } else {
+            info!("Worker效率: 暂无数据 (DHT连接建立中...)");
         }
         
         info!("===============================");
@@ -253,13 +255,18 @@ async fn main() {
 
     let (tx_ih, mut rx_ih) = mpsc::unbounded_channel::<[u8; 20]>();
 
+    // Validate port range
+    let max_workers = (65535 - cfg.start_port as u32 + 1) as usize;
+    let actual_workers = cfg.workers.min(max_workers);
+    if actual_workers < cfg.workers {
+        warn!(requested = cfg.workers, actual = actual_workers, "reduced worker count due to port range");
+    }
+
     // Spawn DHT workers
-    for i in 0..cfg.workers {
+    for i in 0..actual_workers {
         let tx = tx_ih.clone();
         let bootstrap = cfg.bootstrap.clone();
-        let port_u32 = cfg.start_port as u32 + i as u32;
-        if port_u32 > 65535 { warn!(start_port = cfg.start_port, i, "port range exceeded; skipping worker"); break; }
-        let bind_port = port_u32 as u16;
+        let bind_port = cfg.start_port + i as u16;
         let worker_metrics = metrics.clone();
         tokio::spawn(async move {
             let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
@@ -278,7 +285,7 @@ async fn main() {
                     for ih in samples { let _ = tx2.send(ih); }
                 };
                 client.sample_infohashes(&target, &bootstrap, on_samples).await;
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(10)).await;
             }
         });
     }
@@ -360,14 +367,12 @@ async fn main() {
                 info!(ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
                 if let Err(e) = fetch_metadata_for_infohash(ih, peers.clone(), out.as_ref(), mm.clone()).await {
                     warn!(ih = %hex::encode(ih), error = %e, "metadata fetch failed");
-                    // simple delayed retry
+                    // simple delayed retry (don't count as new attempt)
                     let out2 = out.clone();
-                    let mm2 = mm.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_secs(30)).await;
-                        mm2.record_metadata_attempt();
                         info!(ih = %hex::encode(ih), "retry metadata fetch");
-                        let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), mm2).await;
+                        let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), Metrics::new()).await;
                     });
                 }
             });
@@ -376,20 +381,32 @@ async fn main() {
 
     // Periodic metrics reporting
     let report_metrics = metrics.clone();
+    let report_dedup = dedup_manager.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             report_metrics.print_report(60);
+            let (count, _) = report_dedup.stats();
+            info!(seen_infohashes = count, "deduplication cache size");
         }
     });
 
-    // Keep main alive and log stats
+    // Setup graceful shutdown
+    let shutdown_dedup = dedup_manager.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutting down, persisting dedup state...");
+        if let Err(e) = shutdown_dedup.persist().await {
+            warn!(error = %e, "failed to persist dedup state on shutdown");
+        }
+        std::process::exit(0);
+    });
+
+    // Keep main alive
     loop { 
-        sleep(Duration::from_secs(60)).await;
-        let (count, db_path) = dedup_manager.stats();
-        info!(seen_infohashes = count, db_path = ?db_path, "deduplication stats");
+        sleep(Duration::from_secs(3600)).await;
     }
 }
 

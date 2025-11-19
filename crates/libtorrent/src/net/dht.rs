@@ -267,12 +267,15 @@ impl DhtClient {
         on_samples: impl Fn(Vec<[u8; 20]>) + Send + 'static,
     ) {
         let seeds = Self::resolve_bootstrap(bootstrap).await;
-        if seeds.is_empty() { return; }
+        if seeds.is_empty() { 
+            tracing::warn!("failed to resolve any bootstrap nodes");
+            return; 
+        }
         let mut queue: VecDeque<SocketAddr> = seeds.into();
         let mut seen: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
         let mut pending: HashMap<Vec<u8>, SocketAddr> = HashMap::new();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         // kick off
         for _ in 0..8 {
             if let Some(n) = queue.pop_front() {
