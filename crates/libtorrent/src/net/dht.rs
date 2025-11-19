@@ -498,6 +498,161 @@ impl DhtClient {
         //     "sample_infohashes round completed"
         // );
     }
+
+    /// Listen for incoming DHT queries and respond, capturing announce_peer requests
+    pub async fn serve_dht(
+        &self,
+        on_announce: impl Fn([u8; 20], SocketAddr, u16) + Send + 'static + Clone,
+    ) {
+        let mut buf = vec![0u8; 1500];
+        let token_secret = random_node_id();
+        
+        loop {
+            let (n, from) = match self.sock.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "DHT recv error");
+                    continue;
+                }
+            };
+            
+            if n == 0 { continue; }
+            let data = &buf[..n];
+            
+            // Parse bencode message - need to own the data
+            let data_vec = data.to_vec();
+            let mut decoder = Decoder::new(&data_vec);
+            let dec = match decoder.next_object() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            
+            let Ok(mut dict) = dec.unwrap().try_into_dictionary() else { continue; };
+            
+            let mut tid_opt: Option<Vec<u8>> = None;
+            let mut y_opt: Option<Vec<u8>> = None;
+            let mut q_opt: Option<Vec<u8>> = None;
+            let mut node_id_opt: Option<[u8; 20]> = None;
+            let mut info_hash_opt: Option<[u8; 20]> = None;
+            let mut target_opt: Option<[u8; 20]> = None;
+            let mut port_opt: Option<i64> = None;
+            let mut token_opt: Option<Vec<u8>> = None;
+            
+            // Parse top-level keys
+            while let Ok(Some((k, v))) = dict.next_pair() {
+                match k {
+                    b"t" => { if let Ok(b) = v.try_into_bytes() { tid_opt = Some(b.to_vec()); } }
+                    b"y" => { if let Ok(b) = v.try_into_bytes() { y_opt = Some(b.to_vec()); } }
+                    b"q" => { if let Ok(b) = v.try_into_bytes() { q_opt = Some(b.to_vec()); } }
+                    b"a" => {
+                        if let Ok(mut a_dict) = v.try_into_dictionary() {
+                            while let Ok(Some((k2, v2))) = a_dict.next_pair() {
+                                match k2 {
+                                    b"id" => {
+                                        if let Ok(b) = v2.try_into_bytes() {
+                                            if b.len() == 20 {
+                                                let mut id = [0u8; 20];
+                                                id.copy_from_slice(b);
+                                                node_id_opt = Some(id);
+                                            }
+                                        }
+                                    }
+                                    b"info_hash" => {
+                                        if let Ok(b) = v2.try_into_bytes() {
+                                            if b.len() == 20 {
+                                                let mut ih = [0u8; 20];
+                                                ih.copy_from_slice(b);
+                                                info_hash_opt = Some(ih);
+                                            }
+                                        }
+                                    }
+                                    b"target" => {
+                                        if let Ok(b) = v2.try_into_bytes() {
+                                            if b.len() == 20 {
+                                                let mut t = [0u8; 20];
+                                                t.copy_from_slice(b);
+                                                target_opt = Some(t);
+                                            }
+                                        }
+                                    }
+                                    b"port" => {
+                                        if let Ok(i_str) = v2.try_into_integer() {
+                                            if let Ok(i) = i_str.parse::<i64>() {
+                                                port_opt = Some(i);
+                                            }
+                                        }
+                                    }
+                                    b"token" => {
+                                        if let Ok(b) = v2.try_into_bytes() {
+                                            token_opt = Some(b.to_vec());
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            
+            // Only process queries (y=q)
+            if y_opt.as_deref() != Some(b"q") { continue; }
+            let Some(tid) = tid_opt else { continue; };
+            let Some(query_type) = q_opt else { continue; };
+            
+            // Handle different query types
+            match query_type.as_slice() {
+                b"ping" => {
+                    // Respond to ping
+                    let response = encode_ping_response(&tid, &self.node_id);
+                    let _ = self.sock.send_to(&response, from).await;
+                }
+                
+                b"find_node" => {
+                    // Respond with empty nodes list
+                    let empty_nodes = vec![];
+                    let response = encode_find_node_response(&tid, &self.node_id, &empty_nodes);
+                    let _ = self.sock.send_to(&response, from).await;
+                }
+                
+                b"get_peers" => {
+                    // Generate token and respond with empty nodes
+                    let token = generate_token(&from, &token_secret);
+                    let empty_nodes = vec![];
+                    let response = encode_get_peers_response(&tid, &self.node_id, &token, &empty_nodes);
+                    let _ = self.sock.send_to(&response, from).await;
+                }
+                
+                b"announce_peer" => {
+                    // This is what we're interested in!
+                    if let (Some(info_hash), Some(port)) = (info_hash_opt, port_opt) {
+                        // Validate token (simple validation)
+                        if token_opt.is_some() {
+                            let announce_port = port as u16;
+                            tracing::debug!(
+                                ih = %hex::encode(info_hash),
+                                peer = %from,
+                                port = announce_port,
+                                "received announce_peer"
+                            );
+                            
+                            // Callback with discovered infohash
+                            on_announce(info_hash, from, announce_port);
+                            
+                            // Send response
+                            let response = encode_announce_peer_response(&tid, &self.node_id);
+                            let _ = self.sock.send_to(&response, from).await;
+                        }
+                    }
+                }
+                
+                _ => {
+                    // Unknown query type, ignore
+                }
+            }
+        }
+    }
 }
 
 fn encode_find_node(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8> {
@@ -525,6 +680,100 @@ fn encode_find_node(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8
     write_str(&mut out, "q");
     out.push(b'e');
     out
+}
+
+fn encode_ping_response(tid: &[u8], node_id: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.push(b'd');
+    // r
+    write_str(&mut out, "r");
+    out.push(b'd');
+    write_str(&mut out, "id");
+    write_bstr(&mut out, node_id);
+    out.push(b'e');
+    // t
+    write_str(&mut out, "t");
+    write_bstr(&mut out, tid);
+    // y
+    write_str(&mut out, "y");
+    write_str(&mut out, "r");
+    out.push(b'e');
+    out
+}
+
+fn encode_find_node_response(tid: &[u8], node_id: &[u8; 20], nodes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.push(b'd');
+    // r
+    write_str(&mut out, "r");
+    out.push(b'd');
+    write_str(&mut out, "id");
+    write_bstr(&mut out, node_id);
+    write_str(&mut out, "nodes");
+    write_bstr(&mut out, nodes);
+    out.push(b'e');
+    // t
+    write_str(&mut out, "t");
+    write_bstr(&mut out, tid);
+    // y
+    write_str(&mut out, "y");
+    write_str(&mut out, "r");
+    out.push(b'e');
+    out
+}
+
+fn encode_announce_peer_response(tid: &[u8], node_id: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.push(b'd');
+    // r
+    write_str(&mut out, "r");
+    out.push(b'd');
+    write_str(&mut out, "id");
+    write_bstr(&mut out, node_id);
+    out.push(b'e');
+    // t
+    write_str(&mut out, "t");
+    write_bstr(&mut out, tid);
+    // y
+    write_str(&mut out, "y");
+    write_str(&mut out, "r");
+    out.push(b'e');
+    out
+}
+
+fn encode_get_peers_response(tid: &[u8], node_id: &[u8; 20], token: &[u8], nodes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.push(b'd');
+    // r
+    write_str(&mut out, "r");
+    out.push(b'd');
+    write_str(&mut out, "id");
+    write_bstr(&mut out, node_id);
+    write_str(&mut out, "nodes");
+    write_bstr(&mut out, nodes);
+    write_str(&mut out, "token");
+    write_bstr(&mut out, token);
+    out.push(b'e');
+    // t
+    write_str(&mut out, "t");
+    write_bstr(&mut out, tid);
+    // y
+    write_str(&mut out, "y");
+    write_str(&mut out, "r");
+    out.push(b'e');
+    out
+}
+
+fn generate_token(addr: &SocketAddr, secret: &[u8; 20]) -> [u8; 20] {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    addr.hash(&mut hasher);
+    secret.hash(&mut hasher);
+    let hash = hasher.finish();
+    let mut token = [0u8; 20];
+    token[0..8].copy_from_slice(&hash.to_be_bytes());
+    token[8..20].copy_from_slice(&secret[0..12]);
+    token
 }
 
 fn encode_sample_infohashes(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8> {

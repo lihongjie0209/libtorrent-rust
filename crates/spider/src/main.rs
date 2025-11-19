@@ -26,6 +26,9 @@ struct SpiderConfig {
     #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT workers (increments sequentially)")]
         start_port: u16,
 
+    #[arg(long, alias = "listen-port", value_name = "PORT", env = "SPIDER_LISTEN_PORT", default_value_t = 6881, help = "UDP port for passive DHT listener (receives announce_peer)")]
+        passive_port: u16,
+
         #[arg(long = "bootstrap", value_name = "HOST:PORT", num_args = 0..,
                     default_values_t = vec![
                         String::from("router.bittorrent.com:6881"),
@@ -86,6 +89,8 @@ struct Metrics {
     metadata_success: Arc<AtomicU64>,
     // 每个worker的统计
     worker_samples: Arc<DashMap<usize, Arc<AtomicU64>>>,
+    // 被动监听统计
+    passive_announces: Arc<AtomicU64>,
     // 网络统计
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
@@ -99,9 +104,14 @@ impl Metrics {
             metadata_attempts: Arc::new(AtomicU64::new(0)),
             metadata_success: Arc::new(AtomicU64::new(0)),
             worker_samples: Arc::new(DashMap::new()),
+            passive_announces: Arc::new(AtomicU64::new(0)),
             bytes_sent: Arc::new(AtomicU64::new(0)),
             bytes_received: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn record_passive_announce(&self) {
+        self.passive_announces.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_infohash_discovered(&self) {
@@ -151,8 +161,11 @@ impl Metrics {
         let bandwidth_mbps_sent = (mb_sent / interval_secs as f64) * 8.0;
         let bandwidth_mbps_received = (mb_received / interval_secs as f64) * 8.0;
 
+        let passive_count = self.passive_announces.load(Ordering::Relaxed);
+        
         info!("========== 指标报告 ==========");
         info!("发现速率: {:.2} infohash/分钟 (总计: {})", rate_per_min, total_discovered);
+        info!("被动监听: {} announce_peer 接收", passive_count);
         info!("元数据获取: {}/{} ({:.1}% 成功率)", success, attempts, success_rate);
         info!("网络带宽: ↑ {:.2} Mbps ({:.2} MB) | ↓ {:.2} Mbps ({:.2} MB)", 
             bandwidth_mbps_sent, mb_sent, bandwidth_mbps_received, mb_received);
@@ -280,7 +293,7 @@ async fn main() {
         warn!(requested = cfg.workers, actual = actual_workers, "reduced worker count due to port range");
     }
 
-    // Spawn DHT workers
+    // Spawn DHT workers (active crawling only - passive listening separate)
     for i in 0..actual_workers {
         let tx = tx_ih.clone();
         let bootstrap = cfg.bootstrap.clone();
@@ -329,6 +342,28 @@ async fn main() {
             }
         });
     }
+
+    // Spawn passive DHT listener (separate port)
+    let passive_port = cfg.passive_port;
+    let passive_tx = tx_ih.clone();
+    let passive_metrics = metrics.clone();
+    tokio::spawn(async move {
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), passive_port);
+        match DhtClient::bind(local).await {
+            Ok(listener) => {
+                info!(port = passive_port, "🎧 passive DHT listener started (receiving announce_peer)");
+                let on_announce = move |info_hash: [u8; 20], peer: SocketAddr, port: u16| {
+                    passive_metrics.record_passive_announce();
+                    tracing::debug!(ih = %hex::encode(info_hash), peer = %peer, port = port, "📢 received announce_peer");
+                    let _ = passive_tx.send(info_hash);
+                };
+                listener.serve_dht(on_announce).await;
+            }
+            Err(e) => {
+                warn!(error = %e, port = passive_port, "❌ failed to start passive DHT listener");
+            }
+        }
+    });
 
     // Initialize deduplication manager
     let dedup_manager = DeduplicationManager::new(cfg.dedup_db_path.clone());
