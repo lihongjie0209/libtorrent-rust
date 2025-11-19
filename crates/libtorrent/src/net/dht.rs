@@ -11,6 +11,10 @@ const KRPC_Q: &str = "q";
 const KRPC_R: &str = "r";
 const KRPC_E: &str = "e";
 
+// Client identification (2 chars) + version (2 bytes)
+// "LR" = libtorrent-rust
+const CLIENT_VERSION: &[u8; 4] = b"LR\x00\x01"; // LR 0.1
+
 fn random_tid() -> [u8; 2] {
     let mut t = [0u8; 2];
     rand::thread_rng().fill_bytes(&mut t);
@@ -58,6 +62,9 @@ fn encode_get_peers(tid: &[u8], node_id: &[u8; 20], info_hash: &[u8; 20]) -> Vec
     // t
     write_str(&mut out, "t");
     write_bstr(&mut out, tid);
+    // v (client version)
+    write_str(&mut out, "v");
+    write_bstr(&mut out, CLIENT_VERSION);
     // y
     write_str(&mut out, "y");
     write_str(&mut out, "q");
@@ -92,6 +99,9 @@ fn encode_announce_peer(
     // t
     write_str(&mut out, "t");
     write_bstr(&mut out, tid);
+    // v (client version)
+    write_str(&mut out, "v");
+    write_bstr(&mut out, CLIENT_VERSION);
     // y
     write_str(&mut out, "y");
     write_str(&mut out, "q");
@@ -403,28 +413,90 @@ impl DhtClient {
                     if let Ok(dec) = Decoder::new(data).next_object() {
                         if let Ok(mut dict) = dec.unwrap().try_into_dictionary() {
                             let mut tid_opt: Option<Vec<u8>> = None;
+                            let mut response_id: Option<Vec<u8>> = None;
                             let mut nodes_opt: Option<Vec<u8>> = None;
                             let mut samples_blob: Option<Vec<u8>> = None;
+                            let mut interval: Option<i64> = None;
+                            let mut num: Option<i64> = None;
+                            let mut error_msg: Option<String> = None;
+                            
                             while let Ok(Some((k, v))) = dict.next_pair() {
-                                if k == b"t" { if let Ok(b) = v.try_into_bytes() { tid_opt = Some(b.to_vec()); } }
-                                else if k == b"r" {
-                                    if let Ok(mut rdict) = v.try_into_dictionary() {
-                                        while let Ok(Some((rk, rv))) = rdict.next_pair() {
-                                            match rk {
-                                                b"nodes" => { if let Ok(b) = rv.try_into_bytes() { nodes_opt = Some(b.to_vec()); } }
-                                                b"samples" => { if let Ok(b) = rv.try_into_bytes() { samples_blob = Some(b.to_vec()); } }
-                                                _ => {}
+                                match k {
+                                    b"t" => { if let Ok(b) = v.try_into_bytes() { tid_opt = Some(b.to_vec()); } }
+                                    b"e" => {
+                                        // Error response
+                                        if let Ok(mut elist) = v.try_into_list() {
+                                            let _ = elist.next_object(); // error code
+                                            if let Ok(Some(emsg)) = elist.next_object() {
+                                                if let Ok(s) = emsg.try_into_bytes() {
+                                                    error_msg = Some(String::from_utf8_lossy(s).into());
+                                                }
                                             }
                                         }
                                     }
+                                    b"r" => {
+                                        if let Ok(mut rdict) = v.try_into_dictionary() {
+                                            while let Ok(Some((rk, rv))) = rdict.next_pair() {
+                                                match rk {
+                                                    b"id" => { if let Ok(b) = rv.try_into_bytes() { response_id = Some(b.to_vec()); } }
+                                                    b"nodes" => { if let Ok(b) = rv.try_into_bytes() { nodes_opt = Some(b.to_vec()); } }
+                                                    b"samples" => { if let Ok(b) = rv.try_into_bytes() { samples_blob = Some(b.to_vec()); } }
+                                                    b"interval" => { if let Ok(i) = rv.try_into_integer() { if let Ok(val) = i.parse::<i64>() { interval = Some(val); } } }
+                                                    b"num" => { if let Ok(i) = rv.try_into_integer() { if let Ok(val) = i.parse::<i64>() { num = Some(val); } } }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
+                            
+                            // Handle error responses
+                            if let Some(err) = error_msg {
+                                tracing::debug!(from = %from, error = %err, "received error response");
+                                if let Some(tid) = tid_opt { let _ = pending.remove(&tid); }
+                                continue;
+                            }
+                            
+                            // Validate response has 'id' field (required by BEP 5)
+                            if response_id.is_none() || response_id.as_ref().unwrap().len() != 20 {
+                                tracing::debug!(from = %from, "missing or invalid 'id' in response");
+                                continue;
+                            }
+                            
+                            // Validate sample_infohashes response
+                            if let Some(sb) = samples_blob.as_ref() {
+                                // Validate interval (BEP 51: 0 to 21600 seconds)
+                                if let Some(int) = interval {
+                                    if int < 0 || int > 21600 {
+                                        tracing::debug!(from = %from, interval = int, "invalid interval value");
+                                        continue;
+                                    }
+                                    tracing::debug!(from = %from, interval = int, "sample interval received");
+                                }
+                                
+                                // Validate num field
+                                if let Some(n) = num {
+                                    tracing::debug!(from = %from, num = n, "total infohashes count");
+                                }
+                                
+                                // Validate samples length (must be multiple of 20)
+                                if sb.len() % 20 != 0 {
+                                    tracing::debug!(from = %from, len = sb.len(), "invalid samples length");
+                                    continue;
+                                }
+                            }
+                            
                             if let Some(tid) = tid_opt { let _ = pending.remove(&tid); }
                             if let Some(nb) = nodes_opt { for (addr, _nid) in parse_compact_nodes(&nb) { if seen.insert(addr) { queue.push_back(addr); } } }
                             if let Some(sb) = samples_blob {
                                 let mut samples: Vec<[u8;20]> = Vec::new();
                                 for ch in sb.chunks_exact(20) { let mut ih = [0u8;20]; ih.copy_from_slice(ch); samples.push(ih); }
-                                if !samples.is_empty() { on_samples(samples); }
+                                if !samples.is_empty() { 
+                                    tracing::info!(from = %from, count = samples.len(), "received valid samples");
+                                    on_samples(samples); 
+                                }
                             }
                         }
                     }
@@ -471,6 +543,9 @@ fn encode_find_node(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8
     // t
     write_str(&mut out, "t");
     write_bstr(&mut out, tid);
+    // v (client version)
+    write_str(&mut out, "v");
+    write_bstr(&mut out, CLIENT_VERSION);
     // y
     write_str(&mut out, "y");
     write_str(&mut out, "q");
@@ -495,6 +570,9 @@ fn encode_sample_infohashes(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -
     // t
     write_str(&mut out, "t");
     write_bstr(&mut out, tid);
+    // v (client version)
+    write_str(&mut out, "v");
+    write_bstr(&mut out, CLIENT_VERSION);
     // y
     write_str(&mut out, "y");
     write_str(&mut out, "q");
