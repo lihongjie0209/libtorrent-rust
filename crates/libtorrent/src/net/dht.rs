@@ -158,10 +158,17 @@ impl DhtClient {
         let mut out = Vec::new();
         for h in hosts {
             match h.to_socket_addrs() {
-                Ok(mut iter) => {
-                    let resolved: Vec<_> = iter.by_ref().take(4).collect();
-                    tracing::debug!(host = %h, resolved = ?resolved, "bootstrap node resolved");
-                    out.extend(resolved);
+                Ok(iter) => {
+                    let resolved: Vec<_> = iter
+                        .filter(|addr| addr.is_ipv4())  // Only use IPv4 addresses
+                        .take(4)
+                        .collect();
+                    if resolved.is_empty() {
+                        tracing::debug!(host = %h, "no IPv4 addresses found, skipping IPv6");
+                    } else {
+                        tracing::debug!(host = %h, resolved = ?resolved, "bootstrap node resolved");
+                        out.extend(resolved);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(host = %h, error = %e, "failed to resolve bootstrap node");
