@@ -20,13 +20,19 @@ struct SpiderConfig {
     #[arg(long, short = 'l', alias = "listeners", env = "SPIDER_LISTENERS", default_value_t = 1000, help = "Number of passive DHT listeners")]
         listeners: usize,
 
-    #[arg(long, short = 'w', alias = "crawlers", env = "SPIDER_CRAWLERS", default_value_t = 0, help = "Number of active DHT crawlers (0 = passive-only mode)")]
-        crawlers: usize,
+    #[arg(long, alias = "enable-active-crawl", env = "SPIDER_ENABLE_ACTIVE_CRAWL", help = "Enable active sampling from discovered nodes")]
+        enable_active_crawl: bool,
+
+    #[arg(long, alias = "crawl-interval", value_name = "SECS", env = "SPIDER_CRAWL_INTERVAL", default_value_t = 60, help = "Interval in seconds to crawl discovered nodes")]
+        crawl_interval: u64,
+
+    #[arg(long, alias = "max-crawl-nodes", value_name = "COUNT", env = "SPIDER_MAX_CRAWL_NODES", default_value_t = 1000, help = "Maximum number of nodes to keep for active crawling")]
+        max_crawl_nodes: usize,
 
     #[arg(long, alias = "out", value_name = "DIR", env = "SPIDER_OUT", help = "Directory to store fetched metadata")]
         output_dir: Option<std::path::PathBuf>,
 
-    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT listeners/workers (increments sequentially)")]
+    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT listeners (increments sequentially)")]
         start_port: u16,
 
         #[arg(long = "bootstrap", value_name = "HOST:PORT", num_args = 0..,
@@ -171,27 +177,14 @@ impl Metrics {
         info!("🌐 网络带宽: ↑ {:.2} Mbps ({:.2} MB) | ↓ {:.2} Mbps ({:.2} MB)", 
             bandwidth_mbps_sent, mb_sent, bandwidth_mbps_received, mb_received);
         
-        // 主动爬取Worker效率统计
+        // 主动爬取统计
         let mut worker_stats: Vec<_> = self.worker_samples.iter()
             .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
             .collect();
-        worker_stats.sort_by_key(|&(id, _)| id);
         
         if !worker_stats.is_empty() {
             let total_samples: u64 = worker_stats.iter().map(|(_, c)| c).sum();
-            let avg_samples = total_samples as f64 / worker_stats.len() as f64;
-            info!("🕷️  主动爬取: {} 个 crawler, 平均 {:.1} samples/crawler", worker_stats.len(), avg_samples);
-            
-            if worker_stats.len() <= 10 {
-                for (id, count) in worker_stats.iter() {
-                    info!("  Crawler #{}: {} samples", id, count);
-                }
-            } else {
-                for (id, count) in worker_stats.iter().take(5) {
-                    info!("  Crawler #{}: {} samples", id, count);
-                }
-                info!("  ... ({} more crawlers)", worker_stats.len() - 5);
-            }
+            info!("🕷️  主动爬取: {} samples", total_samples);
         }
         
         info!("===============================");
@@ -289,33 +282,28 @@ async fn main() {
     let metrics = Metrics::new();
 
     let (tx_ih, mut rx_ih) = mpsc::unbounded_channel::<[u8; 20]>();
+    let (tx_node, rx_node) = mpsc::unbounded_channel::<SocketAddr>();
 
-    // Calculate total workers (listeners + crawlers)
-    let total_workers = cfg.listeners + cfg.crawlers;
-    let max_workers = (65535 - cfg.start_port as u32 + 1) as usize;
-    let actual_total = total_workers.min(max_workers);
+    // Validate port range
+    let max_listeners = (65535 - cfg.start_port as u32 + 1) as usize;
+    let actual_listeners = cfg.listeners.min(max_listeners);
     
-    if actual_total < total_workers {
-        warn!(requested = total_workers, actual = actual_total, "reduced worker count due to port range");
+    if actual_listeners < cfg.listeners {
+        warn!(requested = cfg.listeners, actual = actual_listeners, "reduced listener count due to port range");
     }
-    
-    let actual_listeners = cfg.listeners.min(actual_total);
-    let actual_crawlers = if cfg.crawlers > 0 {
-        (actual_total - actual_listeners).min(cfg.crawlers)
-    } else {
-        0
-    };
 
     info!(
         listeners = actual_listeners, 
-        crawlers = actual_crawlers, 
-        mode = if actual_crawlers > 0 { "hybrid" } else { "passive-only" },
+        active_crawl = cfg.enable_active_crawl,
+        crawl_interval = if cfg.enable_active_crawl { cfg.crawl_interval } else { 0 },
+        mode = if cfg.enable_active_crawl { "passive + active" } else { "passive-only" },
         "🚀 starting spider"
     );
 
     // Spawn passive DHT listeners (primary collection method)
     for i in 0..actual_listeners {
         let tx = tx_ih.clone();
+        let tx_n = tx_node.clone();
         let bind_port = cfg.start_port + i as u16;
         let listener_metrics = metrics.clone();
         tokio::spawn(async move {
@@ -342,6 +330,7 @@ async fn main() {
                             "📢 received announce_peer"
                         );
                         let _ = tx.send(info_hash);
+                        let _ = tx_n.send(peer); // 记录发现的节点
                     };
                     
                     listener.serve_dht(on_announce).await;
@@ -353,64 +342,95 @@ async fn main() {
         });
     }
 
-    // Spawn active DHT crawlers (optional, supplementary collection)
-    if actual_crawlers > 0 {
-        info!(count = actual_crawlers, "🕷️  starting active crawlers");
-        for i in 0..actual_crawlers {
-            let tx = tx_ih.clone();
-            let bootstrap = cfg.bootstrap.clone();
-            let bind_port = cfg.start_port + actual_listeners as u16 + i as u16;
-            let crawler_id = actual_listeners + i;
-            let worker_metrics = metrics.clone();
+    // Spawn active crawler for discovered nodes (optional)
+    if cfg.enable_active_crawl {
+        info!(
+            interval = cfg.crawl_interval, 
+            max_nodes = cfg.max_crawl_nodes,
+            "🕷️  active crawling enabled"
+        );
+        
+        let mut rx_node_local = rx_node;
+        let crawl_tx = tx_ih.clone();
+        let crawl_metrics = metrics.clone();
+        let crawl_interval = cfg.crawl_interval;
+        let max_nodes = cfg.max_crawl_nodes;
+        
+        tokio::spawn(async move {
+            // 使用 DashSet 存储发现的节点（自动去重）
+            let discovered_nodes = Arc::new(DashMap::<SocketAddr, ()>::new());
+            let nodes_for_crawl = discovered_nodes.clone();
             
+            // 节点收集任务
             tokio::spawn(async move {
-                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
-                let node_id = gen_node_id(crawler_id);
-                let client = match DhtClient::bind_with_id(local, node_id).await { 
-                    Ok(c) => {
-                        let addr = c.local_addr().unwrap_or(local);
-                        tracing::debug!(
-                            crawler = i, 
-                            port = bind_port, 
-                            local_addr = %addr,
-                            node_id = %hex::encode(node_id),
-                            "🕷️  active crawler started"
-                        );
-                        c
-                    }, 
-                    Err(e) => { 
-                        warn!(crawler = i, error = %e, port = bind_port, "crawler bind failed"); 
-                        return; 
-                    } 
-                };
-                let target = gen_target(crawler_id);
-                
-                let mut attempt = 0u32;
-                loop {
-                    attempt += 1;
-                    let tx2 = tx.clone();
-                    let worker_id = crawler_id;
-                    let wm = worker_metrics.clone();
-                    let received_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let received_flag = received_any.clone();
-                    
-                    let on_samples = move |samples: Vec<[u8; 20]>| {
-                        let count = samples.len();
-                        wm.record_worker_samples(worker_id, count as u64);
-                        received_flag.store(true, Ordering::Relaxed);
-                        for ih in samples { let _ = tx2.send(ih); }
-                    };
-                    
-                    client.sample_infohashes(&target, &bootstrap, on_samples).await;
-                    
-                    if !received_any.load(Ordering::Relaxed) {
-                        warn!(crawler = i, attempt, "no samples received in this iteration");
+                while let Some(node) = rx_node_local.recv().await {
+                    if discovered_nodes.len() < max_nodes {
+                        discovered_nodes.insert(node, ());
                     }
-                    
-                    sleep(Duration::from_secs(10)).await;
                 }
             });
-        }
+            
+            // 定期爬取任务
+            let mut interval = tokio::time::interval(Duration::from_secs(crawl_interval));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            
+            loop {
+                interval.tick().await;
+                
+                let node_count = nodes_for_crawl.len();
+                if node_count == 0 {
+                    tracing::debug!("no discovered nodes to crawl yet");
+                    continue;
+                }
+                
+                info!(nodes = node_count, "🕷️  starting active crawl round");
+                
+                // 获取所有节点
+                let nodes: Vec<SocketAddr> = nodes_for_crawl.iter()
+                    .map(|entry| *entry.key())
+                    .collect();
+                
+                // 创建临时客户端进行采集
+                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                if let Ok(client) = DhtClient::bind(local).await {
+                    let mut total_samples = 0;
+                    
+                    for node_addr in nodes.iter().take(100) { // 每轮最多采集100个节点
+                        let tx_crawl = crawl_tx.clone();
+                        let metrics_crawl = crawl_metrics.clone();
+                        
+                        let on_samples = move |samples: Vec<[u8; 20]>| {
+                            let count = samples.len();
+                            metrics_crawl.record_worker_samples(0, count as u64);
+                            for ih in samples {
+                                let _ = tx_crawl.send(ih);
+                            }
+                        };
+                        
+                        // 直接向该节点发送 sample_infohashes 请求
+                        let target = [0u8; 20]; // 使用零target，让节点返回其存储的样本
+                        client.sample_infohashes(&target, &[node_addr.to_string()], on_samples).await;
+                        total_samples += 1;
+                    }
+                    
+                    info!(
+                        crawled = total_samples, 
+                        total_nodes = node_count,
+                        "🕷️  active crawl round completed"
+                    );
+                } else {
+                    warn!("failed to create crawl client");
+                }
+            }
+        });
+    } else {
+        // 如果不启用主动爬取，消费掉 rx_node 防止阻塞
+        tokio::spawn(async move {
+            let mut rx_node_drain = rx_node;
+            while let Some(_) = rx_node_drain.recv().await {
+                // 丢弃
+            }
+        });
     }
 
     // Initialize deduplication manager
