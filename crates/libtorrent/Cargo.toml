@@ -1,0 +1,30 @@
+[package]
+name = "libtorrent"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[dependencies]
+libtorrent-proto = { path = "../libtorrent-proto" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+sha1 = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+bendy = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+percent-encoding = "2.3"
+url = "2.5"
+librqbit-utp = { version = "0.6", optional = true }
+itoa = "1.0"
+
+[dev-dependencies]
+tempfile = "3.12"
+tracing-subscriber = { workspace = true }
+
+[features]
+# Placeholder feature flag to enable uTP transport implementation
+utp = ["dep:librqbit-utp"]
+dht = []

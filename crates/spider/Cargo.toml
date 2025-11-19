@@ -1,0 +1,16 @@
+[package]
+name = "spider"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libtorrent = { path = "../libtorrent", features = ["dht"] }
+tokio = { version = "1.39", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt","time"] }
+hex = "0.4"
+bytes = "1.6"
+rand = "0.8"
+anyhow = "1.0"
+libtorrent-proto = { path = "../libtorrent-proto" }
+clap = { version = "4.5", features = ["derive", "env"] }

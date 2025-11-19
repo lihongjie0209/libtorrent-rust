@@ -1,0 +1,13 @@
+[package]
+name = "libtorrent-proto"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+sha1 = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+rand = { workspace = true }
