@@ -35,6 +35,10 @@ struct SpiderConfig {
                         String::from("router.bittorrent.com:6881"),
                         String::from("dht.transmissionbt.com:6881"),
                         String::from("router.utorrent.com:6881"),
+                        String::from("dht.libtorrent.org:25401"),
+                        String::from("router.silotis.us:6881"),
+                        String::from("dht.aelitis.com:6881"),
+                        String::from("router.bitcomet.com:6881"),
                     ],
                     help = "Bootstrap DHT routers (repeatable)")]
         bootstrap: Vec<String>,
