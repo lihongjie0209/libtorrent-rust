@@ -45,8 +45,8 @@ struct SpiderConfig {
     #[arg(long, alias = "dedup-persist-interval", value_name = "SECS", env = "SPIDER_DEDUP_PERSIST_INTERVAL", default_value_t = 300, help = "Interval in seconds to persist deduplication state to disk")]
         dedup_persist_interval: u64,
 
-    #[arg(long, alias = "jsonline", value_name = "FILE", env = "SPIDER_JSONLINE", help = "Path to jsonline output file for metadata results")]
-        jsonline_path: Option<PathBuf>,
+    #[arg(long, alias = "jsonline", value_name = "FILE", env = "SPIDER_JSONLINE", default_value = "metadata.jsonl", help = "Path to jsonline output file for metadata results")]
+        jsonline_path: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -398,7 +398,7 @@ async fn main() {
         let mut rx = rx_meta;
         while let Some((ih, peers)) = rx.recv().await {
             let out = out_dir.clone();
-            let jsonline = jsonline_path.clone();
+            let jsonline = Some(jsonline_path.clone());
             let mm = meta_metrics.clone();
             tokio::spawn(async move {
                 mm.record_metadata_attempt();
