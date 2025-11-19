@@ -300,13 +300,11 @@ async fn main() {
                 
                 let on_samples = move |samples: Vec<[u8; 20]>| {
                     let count = samples.len();
-                    info!(worker = worker_id, samples = count, "received infohash samples");
                     wm.record_worker_samples(worker_id, count as u64);
                     received_flag.store(true, Ordering::Relaxed);
                     for ih in samples { let _ = tx2.send(ih); }
                 };
                 
-                info!(worker = i, attempt, bootstrap = ?bootstrap, "starting sample_infohashes request");
                 client.sample_infohashes(&target, &bootstrap, on_samples).await;
                 
                 if !received_any.load(Ordering::Relaxed) {

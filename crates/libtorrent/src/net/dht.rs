@@ -391,8 +391,6 @@ impl DhtClient {
             pending.insert(tid.to_vec(), *addr);
         }
         
-        tracing::info!(sent = sample_count_target, "sample_infohashes requests sent");
-        
         // Phase 4: Collect samples
         while tokio::time::Instant::now() < deadline {
             match timeout(Duration::from_millis(500), self.sock.recv_from(&mut buf)).await {
@@ -472,7 +470,6 @@ impl DhtClient {
                                 let mut samples: Vec<[u8;20]> = Vec::new();
                                 for ch in sb.chunks_exact(20) { let mut ih = [0u8;20]; ih.copy_from_slice(ch); samples.push(ih); }
                                 if !samples.is_empty() { 
-                                    tracing::info!(from = %from, count = samples.len(), "received valid samples");
                                     on_samples(samples); 
                                 }
                             }
