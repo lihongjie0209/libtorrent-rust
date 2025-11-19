@@ -183,7 +183,7 @@ impl DhtClient {
             }
         }
         if !out.is_empty() {
-            tracing::info!(count = out.len(), addrs = ?out, "resolved bootstrap nodes");
+            tracing::debug!(count = out.len(), addrs = ?out, "resolved bootstrap nodes");
         }
         out
     }
@@ -298,7 +298,7 @@ impl DhtClient {
     ) {
         // Log socket binding info
         if let Ok(local) = self.sock.local_addr() {
-            tracing::info!(local_addr = %local, "DHT socket bound");
+            tracing::debug!(local_addr = %local, "DHT socket bound");
         }
         
         let seeds = Self::resolve_bootstrap(bootstrap).await;
@@ -313,7 +313,7 @@ impl DhtClient {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         // Phase 1: Send find_node to bootstrap nodes to build routing table
         let mut sent_count = 0;
-        tracing::info!(bootstrap_count = queue.len(), "starting DHT bootstrap with find_node");
+        tracing::debug!(bootstrap_count = queue.len(), "starting DHT bootstrap with find_node");
         for _ in 0..queue.len().min(8) {
             if let Some(n) = queue.pop_front() {
                 if seen.insert(n) {

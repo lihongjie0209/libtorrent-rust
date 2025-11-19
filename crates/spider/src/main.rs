@@ -292,7 +292,7 @@ async fn main() {
             let client = match DhtClient::bind_with_id(local, node_id).await { 
                 Ok(c) => {
                     let addr = c.local_addr().unwrap_or(local);
-                    info!(worker = i, port = bind_port, local_addr = %addr, "DHT client bound successfully");
+                    tracing::debug!(worker = i, port = bind_port, local_addr = %addr, "DHT client bound successfully");
                     c
                 }, 
                 Err(e) => { 
@@ -301,7 +301,7 @@ async fn main() {
                 } 
             };
             let target = gen_target(i);
-            info!(worker = i, port = bind_port, node_id = %hex::encode(node_id), target = %hex::encode(target), "DHT worker started");
+            tracing::debug!(worker = i, port = bind_port, node_id = %hex::encode(node_id), target = %hex::encode(target), "DHT worker started");
             
             let mut attempt = 0u32;
             loop {
@@ -332,7 +332,7 @@ async fn main() {
 
     // Initialize deduplication manager
     let dedup_manager = DeduplicationManager::new(cfg.dedup_db_path.clone());
-    info!(dedup_db = ?cfg.dedup_db_path, "deduplication manager initialized");
+    tracing::debug!(dedup_db = ?cfg.dedup_db_path, "deduplication manager initialized");
 
     // Spawn periodic dedup persistence task
     let dedup_persist = dedup_manager.clone();
@@ -364,7 +364,7 @@ async fn main() {
                 continue; 
             }
             coord_metrics.record_infohash_discovered();
-            info!(ih = %hex::encode(ih), "coordinator received infohash");
+            tracing::debug!(ih = %hex::encode(ih), "coordinator received infohash");
             let (tx_peers, mut rx_peers) = mpsc::unbounded_channel::<SocketAddr>();
             let on_peers = move |peers: Vec<SocketAddr>| { for p in peers { let _ = tx_peers.send(p); } };
             let ih_copy = ih;
@@ -373,9 +373,9 @@ async fn main() {
             tokio::spawn(async move {
                 let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
                 if let Ok(client2) = DhtClient::bind(local).await {
-                    info!(ih = %hex::encode(ih_copy), "start get_peers");
+                    tracing::debug!(ih = %hex::encode(ih_copy), "start get_peers");
                     client2.get_peers_and_announce(ih_copy, 0, &coord_bootstrap2, on_peers).await;
-                    info!(ih = %hex::encode(ih_copy), "get_peers done");
+                    tracing::debug!(ih = %hex::encode(ih_copy), "get_peers done");
                 }
             });
             let mut peers: Vec<SocketAddr> = Vec::new();
@@ -385,7 +385,7 @@ async fn main() {
                     if let Some(addr) = p { peers.push(addr); if peers.len() >= 32 { break; } } else { break; }
                 }
             }
-            info!(ih = %hex::encode(ih), peers = peers.len(), "coordinator collected peers");
+            tracing::debug!(ih = %hex::encode(ih), peers = peers.len(), "coordinator collected peers");
             if !peers.is_empty() { let _ = tx_meta.send((ih, peers)).ok(); }
         }
     });
@@ -402,7 +402,7 @@ async fn main() {
             let mm = meta_metrics.clone();
             tokio::spawn(async move {
                 mm.record_metadata_attempt();
-                info!(ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
+                tracing::debug!(ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
                 match fetch_metadata_for_infohash(ih, peers.clone(), out.as_ref(), mm.clone()).await {
                     Ok(meta) => {
                         let result = MetadataResult {
@@ -415,7 +415,7 @@ async fn main() {
                             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                         };
                         info!("🎉 [SUCCESS] {}", meta.info.name);
-                        info!(ih = %hex::encode(ih), size = result.size.unwrap(), files = meta.info.files.len(), "metadata details");
+                        tracing::debug!(ih = %hex::encode(ih), size = result.size.unwrap(), files = meta.info.files.len(), "metadata details");
                         if let Some(path) = jsonline {
                             let _ = write_jsonline(&path, &result).await;
                         }
@@ -439,7 +439,7 @@ async fn main() {
                         let out2 = out.clone();
                         tokio::spawn(async move {
                             sleep(Duration::from_secs(30)).await;
-                            info!(ih = %hex::encode(ih), "retry metadata fetch");
+                            tracing::debug!(ih = %hex::encode(ih), "retry metadata fetch");
                             let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), Metrics::new()).await;
                         });
                     }
@@ -526,7 +526,7 @@ async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_di
     // Try a few peers
     for addr in peers.into_iter().take(8) {
         // Connect TCP
-        info!(ih = %hex::encode(ih), peer = %addr, "connect peer");
+        tracing::debug!(ih = %hex::encode(ih), peer = %addr, "connect peer");
         if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
             s.set_nodelay(true).ok();
             let transport = transport::from_tcp(s);
@@ -544,10 +544,10 @@ async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_di
                 60,
             );
             // Run with timeout
-            info!(ih = %hex::encode(ih), peer = %addr, "peer session start");
+            tracing::debug!(ih = %hex::encode(ih), peer = %addr, "peer session start");
             let res = tokio::time::timeout(Duration::from_secs(20), session.run()).await;
             let _ = res; // ignore run result
-            info!(ih = %hex::encode(ih), peer = %addr, "peer session end");
+            tracing::debug!(ih = %hex::encode(ih), peer = %addr, "peer session end");
         }
         // Check if metadata applied
         if let Ok(h) = handle.try_read() {
