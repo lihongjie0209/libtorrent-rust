@@ -26,13 +26,13 @@ struct SpiderConfig {
     #[arg(long, alias = "crawl-interval", value_name = "SECS", env = "SPIDER_CRAWL_INTERVAL", default_value_t = 60, help = "Interval in seconds to crawl discovered nodes")]
         crawl_interval: u64,
 
-    #[arg(long, alias = "max-crawl-nodes", value_name = "COUNT", env = "SPIDER_MAX_CRAWL_NODES", default_value_t = 1000, help = "Maximum number of nodes to keep for active crawling")]
-        max_crawl_nodes: usize,
+    #[arg(long, alias = "min-crawl-nodes", value_name = "COUNT", env = "SPIDER_MIN_CRAWL_NODES", default_value_t = 1000, help = "Minimum number of nodes to sample per crawl round")]
+        min_crawl_nodes: usize,
 
     #[arg(long, alias = "out", value_name = "DIR", env = "SPIDER_OUT", help = "Directory to store fetched metadata")]
         output_dir: Option<std::path::PathBuf>,
 
-    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT listeners (increments sequentially)")]
+    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 6880, help = "Starting UDP port for DHT listeners (increments sequentially)")]
         start_port: u16,
 
         #[arg(long = "bootstrap", value_name = "HOST:PORT", num_args = 0..,
@@ -346,7 +346,7 @@ async fn main() {
     if cfg.enable_active_crawl {
         info!(
             interval = cfg.crawl_interval, 
-            max_nodes = cfg.max_crawl_nodes,
+            min_nodes = cfg.min_crawl_nodes,
             "🕷️  active crawling enabled"
         );
         
@@ -354,19 +354,17 @@ async fn main() {
         let crawl_tx = tx_ih.clone();
         let crawl_metrics = metrics.clone();
         let crawl_interval = cfg.crawl_interval;
-        let max_nodes = cfg.max_crawl_nodes;
+        let min_nodes = cfg.min_crawl_nodes;
         
         tokio::spawn(async move {
-            // 使用 DashSet 存储发现的节点（自动去重）
+            // 使用 DashMap 存储发现的节点（自动去重，无上限）
             let discovered_nodes = Arc::new(DashMap::<SocketAddr, ()>::new());
             let nodes_for_crawl = discovered_nodes.clone();
             
-            // 节点收集任务
+            // 节点收集任务（无限制）
             tokio::spawn(async move {
                 while let Some(node) = rx_node_local.recv().await {
-                    if discovered_nodes.len() < max_nodes {
-                        discovered_nodes.insert(node, ());
-                    }
+                    discovered_nodes.insert(node, ());
                 }
             });
             
@@ -395,7 +393,7 @@ async fn main() {
                 if let Ok(client) = DhtClient::bind(local).await {
                     let mut total_samples = 0;
                     
-                    for node_addr in nodes.iter().take(100) { // 每轮最多采集100个节点
+                    for node_addr in nodes.iter().take(min_nodes) { // 每轮采集 min_nodes 个节点
                         let tx_crawl = crawl_tx.clone();
                         let metrics_crawl = crawl_metrics.clone();
                         
