@@ -414,7 +414,8 @@ async fn main() {
                             error: None,
                             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                         };
-                        info!(ih = %hex::encode(ih), name = %meta.info.name, size = result.size.unwrap(), "✓ metadata fetched successfully");
+                        info!("🎉 [SUCCESS] {}", meta.info.name);
+                        info!(ih = %hex::encode(ih), size = result.size.unwrap(), files = meta.info.files.len(), "metadata details");
                         if let Some(path) = jsonline {
                             let _ = write_jsonline(&path, &result).await;
                         }
@@ -429,7 +430,8 @@ async fn main() {
                             error: Some(e.to_string()),
                             timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
                         };
-                        warn!(ih = %hex::encode(ih), error = %e, "✗ metadata fetch failed");
+                        warn!("❌ [FAILED] {}", hex::encode(ih));
+                        warn!(ih = %hex::encode(ih), error = %e, "metadata fetch error details");
                         if let Some(path) = jsonline {
                             let _ = write_jsonline(&path, &result).await;
                         }
