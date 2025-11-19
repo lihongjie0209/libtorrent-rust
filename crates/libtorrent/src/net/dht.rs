@@ -304,31 +304,95 @@ impl DhtClient {
         let mut pending: HashMap<Vec<u8>, SocketAddr> = HashMap::new();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        // kick off
+        // Phase 1: Send find_node to bootstrap nodes to build routing table
         let mut sent_count = 0;
-        tracing::info!(bootstrap_count = queue.len(), "starting sample_infohashes with bootstrap nodes");
-        for _ in 0..16 {
+        let mut find_node_count = 0;
+        tracing::info!(bootstrap_count = queue.len(), "starting DHT bootstrap with find_node");
+        for _ in 0..queue.len().min(8) {
             if let Some(n) = queue.pop_front() {
                 if seen.insert(n) {
                     let tid = random_tid();
-                    let msg = encode_sample_infohashes(&tid, &self.node_id, target);
+                    let msg = encode_find_node(&tid, &self.node_id, target);
                     match self.sock.send_to(&msg, n).await {
                         Ok(bytes) => {
+                            find_node_count += 1;
                             sent_count += 1;
-                            tracing::debug!(to = %n, bytes, "sent sample_infohashes request");
+                            tracing::debug!(to = %n, bytes, "sent find_node request");
                         }
                         Err(e) => {
-                            tracing::warn!(to = %n, error = %e, "failed to send sample_infohashes");
+                            tracing::warn!(to = %n, error = %e, "failed to send find_node");
                         }
                     }
                     pending.insert(tid.to_vec(), n);
                 }
             }
         }
-        tracing::debug!(sent = sent_count, pending = pending.len(), "initial requests sent");
+        tracing::debug!(sent = find_node_count, pending = pending.len(), "find_node requests sent");
         
+        // Phase 2: Collect node responses for 3 seconds
+        let mut nodes_collected = Vec::new();
         let mut buf = vec![0u8; 1500];
         let mut responses_received = 0;
+        let collect_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        
+        while tokio::time::Instant::now() < collect_deadline {
+            match timeout(Duration::from_millis(100), self.sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) => {
+                    if n == 0 { continue; }
+                    responses_received += 1;
+                    tracing::debug!(from = %from, bytes = n, "received find_node response");
+                    let data = &buf[..n];
+                    if let Ok(dec) = Decoder::new(data).next_object() {
+                        if let Ok(mut dict) = dec.unwrap().try_into_dictionary() {
+                            while let Ok(Some((k, v))) = dict.next_pair() {
+                                if k == b"t" { if let Ok(b) = v.try_into_bytes() { let _ = pending.remove(&b.to_vec()); } }
+                                else if k == b"r" {
+                                    if let Ok(mut rdict) = v.try_into_dictionary() {
+                                        while let Ok(Some((rk, rv))) = rdict.next_pair() {
+                                            if rk == b"nodes" {
+                                                if let Ok(b) = rv.try_into_bytes() {
+                                                    for (addr, _nid) in parse_compact_nodes(&b) {
+                                                        if seen.insert(addr) {
+                                                            nodes_collected.push(addr);
+                                                            queue.push_back(addr);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        tracing::info!(nodes_collected = nodes_collected.len(), responses = responses_received, "collected DHT nodes");
+        
+        // Phase 3: Send sample_infohashes to collected nodes
+        pending.clear();
+        let sample_count_target = nodes_collected.len().min(20);
+        for addr in nodes_collected.iter().take(sample_count_target) {
+            let tid = random_tid();
+            let msg = encode_sample_infohashes(&tid, &self.node_id, target);
+            match self.sock.send_to(&msg, *addr).await {
+                Ok(bytes) => {
+                    sent_count += 1;
+                    tracing::debug!(to = %addr, bytes, "sent sample_infohashes request");
+                }
+                Err(e) => {
+                    tracing::warn!(to = %addr, error = %e, "failed to send sample_infohashes");
+                }
+            }
+            pending.insert(tid.to_vec(), *addr);
+        }
+        
+        tracing::info!(sent = sample_count_target, "sample_infohashes requests sent");
+        
+        // Phase 4: Collect samples
         while tokio::time::Instant::now() < deadline {
             match timeout(Duration::from_millis(500), self.sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, from))) => {
@@ -367,14 +431,14 @@ impl DhtClient {
             }
             _ => {}
             }
-            // keep pipeline
-            while pending.len() < 16 {
-                if let Some(n) = queue.pop_front() {
+            // keep sending to more nodes
+            while pending.len() < 16 && !nodes_collected.is_empty() {
+                if let Some(n) = nodes_collected.pop() {
                     let tid = random_tid();
                     let msg = encode_sample_infohashes(&tid, &self.node_id, target);
                     if let Ok(bytes) = self.sock.send_to(&msg, n).await {
                         sent_count += 1;
-                        tracing::trace!(to = %n, bytes, "sent follow-up request");
+                        tracing::trace!(to = %n, bytes, "sent follow-up sample_infohashes");
                     }
                     pending.insert(tid.to_vec(), n);
                 } else { break; }
@@ -388,6 +452,30 @@ impl DhtClient {
             "sample_infohashes round completed"
         );
     }
+}
+
+fn encode_find_node(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    out.push(b'd');
+    // a
+    write_str(&mut out, "a");
+    out.push(b'd');
+    write_str(&mut out, "id");
+    write_bstr(&mut out, node_id);
+    write_str(&mut out, "target");
+    write_bstr(&mut out, target);
+    out.push(b'e');
+    // q
+    write_str(&mut out, "q");
+    write_str(&mut out, "find_node");
+    // t
+    write_str(&mut out, "t");
+    write_bstr(&mut out, tid);
+    // y
+    write_str(&mut out, "y");
+    write_str(&mut out, "q");
+    out.push(b'e');
+    out
 }
 
 fn encode_sample_infohashes(tid: &[u8], node_id: &[u8; 20], target: &[u8; 20]) -> Vec<u8> {
