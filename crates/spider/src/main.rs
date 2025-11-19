@@ -306,6 +306,7 @@ async fn main() {
         let tx_n = tx_node.clone();
         let bind_port = cfg.start_port + i as u16;
         let listener_metrics = metrics.clone();
+        let bootstrap_nodes = cfg.bootstrap.clone();
         tokio::spawn(async move {
             let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
             let node_id = gen_node_id(i);
@@ -320,6 +321,13 @@ async fn main() {
                         node_id = %hex::encode(node_id),
                         "🎧 passive DHT listener started"
                     );
+                    
+                    // Bootstrap: join DHT network by pinging bootstrap nodes
+                    tracing::debug!(listener = i, "🔗 joining DHT network via bootstrap");
+                    let dummy_ih = [0u8; 20];
+                    let noop_peers = |_: Vec<SocketAddr>| {};
+                    listener.get_peers_and_announce(dummy_ih, bind_port, &bootstrap_nodes, noop_peers).await;
+                    tracing::debug!(listener = i, "✅ DHT bootstrap completed");
                     
                     let on_announce = move |info_hash: [u8; 20], peer: SocketAddr, port: u16| {
                         listener_metrics.record_passive_announce();
