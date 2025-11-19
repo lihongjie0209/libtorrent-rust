@@ -372,7 +372,7 @@ impl DhtClient {
             }
         }
         
-        tracing::info!(nodes_collected = nodes_collected.len(), responses = responses_received, "collected DHT nodes");
+        // tracing::info!(nodes_collected = nodes_collected.len(), responses = responses_received, "collected DHT nodes");
         
         // Phase 3: Send sample_infohashes to collected nodes
         pending.clear();
@@ -491,12 +491,12 @@ impl DhtClient {
             }
         }
         
-        tracing::info!(
-            sent = sent_count, 
-            responses = responses_received, 
-            pending = pending.len(),
-            "sample_infohashes round completed"
-        );
+        // tracing::info!(
+        //     sent = sent_count, 
+        //     responses = responses_received, 
+        //     pending = pending.len(),
+        //     "sample_infohashes round completed"
+        // );
     }
 }
 
