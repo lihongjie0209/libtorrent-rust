@@ -17,17 +17,17 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "spider", about = "DHT metadata spider", version)]
 struct SpiderConfig {
-    #[arg(long, short = 'w', env = "SPIDER_WORKERS", default_value_t = 1000, help = "Number of DHT workers")]
-        workers: usize,
+    #[arg(long, short = 'l', alias = "listeners", env = "SPIDER_LISTENERS", default_value_t = 1000, help = "Number of passive DHT listeners")]
+        listeners: usize,
+
+    #[arg(long, short = 'w', alias = "crawlers", env = "SPIDER_CRAWLERS", default_value_t = 0, help = "Number of active DHT crawlers (0 = passive-only mode)")]
+        crawlers: usize,
 
     #[arg(long, alias = "out", value_name = "DIR", env = "SPIDER_OUT", help = "Directory to store fetched metadata")]
         output_dir: Option<std::path::PathBuf>,
 
-    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT workers (increments sequentially)")]
+    #[arg(long, value_name = "PORT", env = "SPIDER_START_PORT", default_value_t = 40000, help = "Starting UDP port for DHT listeners/workers (increments sequentially)")]
         start_port: u16,
-
-    #[arg(long, alias = "listen-port", value_name = "PORT", env = "SPIDER_LISTEN_PORT", default_value_t = 6881, help = "UDP port for passive DHT listener (receives announce_peer)")]
-        passive_port: u16,
 
         #[arg(long = "bootstrap", value_name = "HOST:PORT", num_args = 0..,
                     default_values_t = vec![
@@ -162,30 +162,36 @@ impl Metrics {
         let bandwidth_mbps_received = (mb_received / interval_secs as f64) * 8.0;
 
         let passive_count = self.passive_announces.load(Ordering::Relaxed);
+        let passive_rate_per_min = (passive_count as f64 / interval_secs as f64) * 60.0;
         
         info!("========== 指标报告 ==========");
-        info!("发现速率: {:.2} infohash/分钟 (总计: {})", rate_per_min, total_discovered);
-        info!("被动监听: {} announce_peer 接收", passive_count);
-        info!("元数据获取: {}/{} ({:.1}% 成功率)", success, attempts, success_rate);
-        info!("网络带宽: ↑ {:.2} Mbps ({:.2} MB) | ↓ {:.2} Mbps ({:.2} MB)", 
+        info!("📊 发现速率: {:.2} infohash/分钟 (总计: {})", rate_per_min, total_discovered);
+        info!("🎧 被动监听: {} announce_peer ({:.2}/分钟)", passive_count, passive_rate_per_min);
+        info!("📦 元数据获取: {}/{} ({:.1}% 成功率)", success, attempts, success_rate);
+        info!("🌐 网络带宽: ↑ {:.2} Mbps ({:.2} MB) | ↓ {:.2} Mbps ({:.2} MB)", 
             bandwidth_mbps_sent, mb_sent, bandwidth_mbps_received, mb_received);
         
-        // Worker效率统计
+        // 主动爬取Worker效率统计
         let mut worker_stats: Vec<_> = self.worker_samples.iter()
             .map(|entry| (*entry.key(), entry.value().load(Ordering::Relaxed)))
             .collect();
         worker_stats.sort_by_key(|&(id, _)| id);
         
         if !worker_stats.is_empty() {
-            info!("Worker效率 (前10个):");
-            for (id, count) in worker_stats.iter().take(10) {
-                info!("  Worker #{}: {} samples", id, count);
-            }
             let total_samples: u64 = worker_stats.iter().map(|(_, c)| c).sum();
             let avg_samples = total_samples as f64 / worker_stats.len() as f64;
-            info!("  平均: {:.1} samples/worker", avg_samples);
-        } else {
-            info!("Worker效率: 暂无数据 (DHT连接建立中...)");
+            info!("🕷️  主动爬取: {} 个 crawler, 平均 {:.1} samples/crawler", worker_stats.len(), avg_samples);
+            
+            if worker_stats.len() <= 10 {
+                for (id, count) in worker_stats.iter() {
+                    info!("  Crawler #{}: {} samples", id, count);
+                }
+            } else {
+                for (id, count) in worker_stats.iter().take(5) {
+                    info!("  Crawler #{}: {} samples", id, count);
+                }
+                info!("  ... ({} more crawlers)", worker_stats.len() - 5);
+            }
         }
         
         info!("===============================");
@@ -279,91 +285,133 @@ async fn main() {
     // Parse CLI arguments
     let cfg = SpiderConfig::parse();
 
-    info!(workers = cfg.workers, out = ?cfg.output_dir, "starting spider");
-
     // Initialize metrics
     let metrics = Metrics::new();
 
     let (tx_ih, mut rx_ih) = mpsc::unbounded_channel::<[u8; 20]>();
 
-    // Validate port range
+    // Calculate total workers (listeners + crawlers)
+    let total_workers = cfg.listeners + cfg.crawlers;
     let max_workers = (65535 - cfg.start_port as u32 + 1) as usize;
-    let actual_workers = cfg.workers.min(max_workers);
-    if actual_workers < cfg.workers {
-        warn!(requested = cfg.workers, actual = actual_workers, "reduced worker count due to port range");
+    let actual_total = total_workers.min(max_workers);
+    
+    if actual_total < total_workers {
+        warn!(requested = total_workers, actual = actual_total, "reduced worker count due to port range");
     }
+    
+    let actual_listeners = cfg.listeners.min(actual_total);
+    let actual_crawlers = if cfg.crawlers > 0 {
+        (actual_total - actual_listeners).min(cfg.crawlers)
+    } else {
+        0
+    };
 
-    // Spawn DHT workers (active crawling only - passive listening separate)
-    for i in 0..actual_workers {
+    info!(
+        listeners = actual_listeners, 
+        crawlers = actual_crawlers, 
+        mode = if actual_crawlers > 0 { "hybrid" } else { "passive-only" },
+        "🚀 starting spider"
+    );
+
+    // Spawn passive DHT listeners (primary collection method)
+    for i in 0..actual_listeners {
         let tx = tx_ih.clone();
-        let bootstrap = cfg.bootstrap.clone();
         let bind_port = cfg.start_port + i as u16;
-        let worker_metrics = metrics.clone();
+        let listener_metrics = metrics.clone();
         tokio::spawn(async move {
             let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
             let node_id = gen_node_id(i);
-            let client = match DhtClient::bind_with_id(local, node_id).await { 
-                Ok(c) => {
-                    let addr = c.local_addr().unwrap_or(local);
-                    tracing::debug!(worker = i, port = bind_port, local_addr = %addr, "DHT client bound successfully");
-                    c
-                }, 
-                Err(e) => { 
-                    warn!(worker = i, error = %e, port = bind_port, "dht bind failed"); 
-                    return; 
-                } 
-            };
-            let target = gen_target(i);
-            tracing::debug!(worker = i, port = bind_port, node_id = %hex::encode(node_id), target = %hex::encode(target), "DHT worker started");
             
-            let mut attempt = 0u32;
-            loop {
-                attempt += 1;
-                let tx2 = tx.clone();
-                let worker_id = i;
-                let wm = worker_metrics.clone();
-                let received_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let received_flag = received_any.clone();
-                
-                let on_samples = move |samples: Vec<[u8; 20]>| {
-                    let count = samples.len();
-                    wm.record_worker_samples(worker_id, count as u64);
-                    received_flag.store(true, Ordering::Relaxed);
-                    for ih in samples { let _ = tx2.send(ih); }
-                };
-                
-                client.sample_infohashes(&target, &bootstrap, on_samples).await;
-                
-                if !received_any.load(Ordering::Relaxed) {
-                    warn!(worker = i, attempt, "no samples received in this iteration");
+            match DhtClient::bind_with_id(local, node_id).await {
+                Ok(listener) => {
+                    let addr = listener.local_addr().unwrap_or(local);
+                    tracing::debug!(
+                        listener = i, 
+                        port = bind_port, 
+                        local_addr = %addr, 
+                        node_id = %hex::encode(node_id),
+                        "🎧 passive DHT listener started"
+                    );
+                    
+                    let on_announce = move |info_hash: [u8; 20], peer: SocketAddr, port: u16| {
+                        listener_metrics.record_passive_announce();
+                        tracing::debug!(
+                            ih = %hex::encode(info_hash), 
+                            peer = %peer, 
+                            port = port, 
+                            "📢 received announce_peer"
+                        );
+                        let _ = tx.send(info_hash);
+                    };
+                    
+                    listener.serve_dht(on_announce).await;
                 }
-                
-                sleep(Duration::from_secs(10)).await;
+                Err(e) => {
+                    warn!(listener = i, error = %e, port = bind_port, "❌ failed to start listener");
+                }
             }
         });
     }
 
-    // Spawn passive DHT listener (separate port)
-    let passive_port = cfg.passive_port;
-    let passive_tx = tx_ih.clone();
-    let passive_metrics = metrics.clone();
-    tokio::spawn(async move {
-        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), passive_port);
-        match DhtClient::bind(local).await {
-            Ok(listener) => {
-                info!(port = passive_port, "🎧 passive DHT listener started (receiving announce_peer)");
-                let on_announce = move |info_hash: [u8; 20], peer: SocketAddr, port: u16| {
-                    passive_metrics.record_passive_announce();
-                    tracing::debug!(ih = %hex::encode(info_hash), peer = %peer, port = port, "📢 received announce_peer");
-                    let _ = passive_tx.send(info_hash);
+    // Spawn active DHT crawlers (optional, supplementary collection)
+    if actual_crawlers > 0 {
+        info!(count = actual_crawlers, "🕷️  starting active crawlers");
+        for i in 0..actual_crawlers {
+            let tx = tx_ih.clone();
+            let bootstrap = cfg.bootstrap.clone();
+            let bind_port = cfg.start_port + actual_listeners as u16 + i as u16;
+            let crawler_id = actual_listeners + i;
+            let worker_metrics = metrics.clone();
+            
+            tokio::spawn(async move {
+                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
+                let node_id = gen_node_id(crawler_id);
+                let client = match DhtClient::bind_with_id(local, node_id).await { 
+                    Ok(c) => {
+                        let addr = c.local_addr().unwrap_or(local);
+                        tracing::debug!(
+                            crawler = i, 
+                            port = bind_port, 
+                            local_addr = %addr,
+                            node_id = %hex::encode(node_id),
+                            "🕷️  active crawler started"
+                        );
+                        c
+                    }, 
+                    Err(e) => { 
+                        warn!(crawler = i, error = %e, port = bind_port, "crawler bind failed"); 
+                        return; 
+                    } 
                 };
-                listener.serve_dht(on_announce).await;
-            }
-            Err(e) => {
-                warn!(error = %e, port = passive_port, "❌ failed to start passive DHT listener");
-            }
+                let target = gen_target(crawler_id);
+                
+                let mut attempt = 0u32;
+                loop {
+                    attempt += 1;
+                    let tx2 = tx.clone();
+                    let worker_id = crawler_id;
+                    let wm = worker_metrics.clone();
+                    let received_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let received_flag = received_any.clone();
+                    
+                    let on_samples = move |samples: Vec<[u8; 20]>| {
+                        let count = samples.len();
+                        wm.record_worker_samples(worker_id, count as u64);
+                        received_flag.store(true, Ordering::Relaxed);
+                        for ih in samples { let _ = tx2.send(ih); }
+                    };
+                    
+                    client.sample_infohashes(&target, &bootstrap, on_samples).await;
+                    
+                    if !received_any.load(Ordering::Relaxed) {
+                        warn!(crawler = i, attempt, "no samples received in this iteration");
+                    }
+                    
+                    sleep(Duration::from_secs(10)).await;
+                }
+            });
         }
-    });
+    }
 
     // Initialize deduplication manager
     let dedup_manager = DeduplicationManager::new(cfg.dedup_db_path.clone());
