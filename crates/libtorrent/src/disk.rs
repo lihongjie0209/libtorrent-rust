@@ -157,10 +157,22 @@ mod tests {
             name: name.to_string(),
             piece_length: piece_len,
             pieces,
-            files: vec![crate::metainfo::FileEntry { length: total, path: PathBuf::from(name) }],
+            files: vec![crate::metainfo::FileEntry { 
+                length: total, 
+                path: PathBuf::from(name),
+                attr: None,
+                sha1: None,
+                md5sum: None,
+                mtime: None,
+                symlink_path: None,
+            }],
             private: false,
             raw_infohash: [0u8; 20],
             raw_info_bencode: Vec::new(),
+            meta_version: 1,
+            file_tree: None,
+            pieces_v2: None,
+            raw_infohash_v2: None,
         }
     }
 
@@ -213,12 +225,32 @@ mod tests {
             piece_length: piece_len,
             pieces,
             files: vec![
-                crate::metainfo::FileEntry { length: f1, path: PathBuf::from("file1.bin") },
-                crate::metainfo::FileEntry { length: f2, path: PathBuf::from("dir").join("file2.bin") },
+                crate::metainfo::FileEntry { 
+                    length: f1, 
+                    path: PathBuf::from("file1.bin"),
+                    attr: None,
+                    sha1: None,
+                    md5sum: None,
+                    mtime: None,
+                    symlink_path: None,
+                },
+                crate::metainfo::FileEntry { 
+                    length: f2, 
+                    path: PathBuf::from("dir").join("file2.bin"),
+                    attr: None,
+                    sha1: None,
+                    md5sum: None,
+                    mtime: None,
+                    symlink_path: None,
+                },
             ],
             private: false,
             raw_infohash: [0u8; 20],
             raw_info_bencode: Vec::new(),
+            meta_version: 1,
+            file_tree: None,
+            pieces_v2: None,
+            raw_infohash_v2: None,
         };
 
         let dm = DiskManager::new(dir.path(), &info).await.unwrap();

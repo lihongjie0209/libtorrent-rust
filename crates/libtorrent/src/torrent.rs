@@ -384,7 +384,16 @@ impl TorrentHandle {
         // Construct a minimal TorrentMeta preserving trackers if any (unknown for magnets)
         let announce = self.meta.announce.clone();
         let announce_list = self.meta.announce_list.clone();
-        self.meta = TorrentMeta { announce, announce_list, web_seeds: self.meta.web_seeds.clone(), info };
+        self.meta = TorrentMeta { 
+            announce, 
+            announce_list, 
+            web_seeds: self.meta.web_seeds.clone(), 
+            info,
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            encoding: None,
+        };
 
         // Rebuild piece sizes and block maps
         let num_pieces = self.meta.info.num_pieces();
@@ -437,11 +446,24 @@ mod tests {
                 files: vec![FileEntry {
                     length: 1000,
                     path: PathBuf::from("test.txt"),
+                    attr: None,
+                    sha1: None,
+                    md5sum: None,
+                    mtime: None,
+                    symlink_path: None,
                 }],
                 private: false,
                 raw_infohash: [0u8; 20],
                 raw_info_bencode: Vec::new(),
+                meta_version: 1,
+                file_tree: None,
+                pieces_v2: None,
+                raw_infohash_v2: None,
             },
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            encoding: None,
         }
     }
 

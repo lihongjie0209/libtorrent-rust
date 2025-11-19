@@ -171,8 +171,22 @@ async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_di
         announce_list: Vec::new(),
         web_seeds: Vec::new(),
         info: libtorrent::metainfo::InfoDict {
-            name: String::new(), piece_length: 16384, pieces: Vec::new(), files: Vec::new(), private: false, raw_infohash: [0u8;20], raw_info_bencode: Vec::new()
-        }
+            name: String::new(), 
+            piece_length: 16384, 
+            pieces: Vec::new(), 
+            files: Vec::new(), 
+            private: false, 
+            raw_infohash: [0u8;20], 
+            raw_info_bencode: Vec::new(),
+            meta_version: 1,
+            file_tree: None,
+            pieces_v2: None,
+            raw_infohash_v2: None,
+        },
+        comment: None,
+        created_by: None,
+        creation_date: None,
+        encoding: None,
     };
     let handle: SharedTorrentHandle = Arc::new(RwLock::new(TorrentHandle::new(dummy_meta)));
 
