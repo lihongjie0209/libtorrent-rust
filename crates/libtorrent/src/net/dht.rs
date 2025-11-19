@@ -148,12 +148,28 @@ impl DhtClient {
         Ok(Self { sock, node_id })
     }
 
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+
     // Note: tokio::net::UdpSocket is not clonable; avoid cloning the client.
 
     async fn resolve_bootstrap(hosts: &[String]) -> Vec<SocketAddr> {
         let mut out = Vec::new();
         for h in hosts {
-            if let Ok(mut iter) = h.to_socket_addrs() { out.extend(iter.by_ref().take(4)); }
+            match h.to_socket_addrs() {
+                Ok(mut iter) => {
+                    let resolved: Vec<_> = iter.by_ref().take(4).collect();
+                    tracing::debug!(host = %h, resolved = ?resolved, "bootstrap node resolved");
+                    out.extend(resolved);
+                }
+                Err(e) => {
+                    tracing::warn!(host = %h, error = %e, "failed to resolve bootstrap node");
+                }
+            }
+        }
+        if !out.is_empty() {
+            tracing::info!(count = out.len(), addrs = ?out, "resolved bootstrap nodes");
         }
         out
     }
@@ -277,21 +293,35 @@ impl DhtClient {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         // kick off
+        let mut sent_count = 0;
         for _ in 0..8 {
             if let Some(n) = queue.pop_front() {
                 if seen.insert(n) {
                     let tid = random_tid();
                     let msg = encode_sample_infohashes(&tid, &self.node_id, target);
-                    let _ = self.sock.send_to(&msg, n).await;
+                    match self.sock.send_to(&msg, n).await {
+                        Ok(bytes) => {
+                            sent_count += 1;
+                            tracing::debug!(to = %n, bytes, "sent sample_infohashes request");
+                        }
+                        Err(e) => {
+                            tracing::warn!(to = %n, error = %e, "failed to send sample_infohashes");
+                        }
+                    }
                     pending.insert(tid.to_vec(), n);
                 }
             }
         }
+        tracing::debug!(sent = sent_count, pending = pending.len(), "initial requests sent");
+        
         let mut buf = vec![0u8; 1500];
+        let mut responses_received = 0;
         while tokio::time::Instant::now() < deadline {
             match timeout(Duration::from_millis(500), self.sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, _from))) => {
+                Ok(Ok((n, from))) => {
                     if n == 0 { continue; }
+                    responses_received += 1;
+                    tracing::debug!(from = %from, bytes = n, "received DHT response");
                     let data = &buf[..n];
                     if let Ok(dec) = Decoder::new(data).next_object() {
                         if let Ok(mut dict) = dec.unwrap().try_into_dictionary() {
@@ -329,11 +359,21 @@ impl DhtClient {
                 if let Some(n) = queue.pop_front() {
                     let tid = random_tid();
                     let msg = encode_sample_infohashes(&tid, &self.node_id, target);
-                    let _ = self.sock.send_to(&msg, n).await;
+                    if let Ok(bytes) = self.sock.send_to(&msg, n).await {
+                        sent_count += 1;
+                        tracing::trace!(to = %n, bytes, "sent follow-up request");
+                    }
                     pending.insert(tid.to_vec(), n);
                 } else { break; }
             }
         }
+        
+        tracing::info!(
+            sent = sent_count, 
+            responses = responses_received, 
+            pending = pending.len(),
+            "sample_infohashes round completed"
+        );
     }
 }
 

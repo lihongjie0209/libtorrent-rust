@@ -271,20 +271,44 @@ async fn main() {
         tokio::spawn(async move {
             let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_port);
             let node_id = gen_node_id(i);
-            let client = match DhtClient::bind_with_id(local, node_id).await { Ok(c) => c, Err(e) => { warn!(error = %e, "dht bind failed"); return; } };
+            let client = match DhtClient::bind_with_id(local, node_id).await { 
+                Ok(c) => {
+                    let addr = c.local_addr().unwrap_or(local);
+                    info!(worker = i, port = bind_port, local_addr = %addr, "DHT client bound successfully");
+                    c
+                }, 
+                Err(e) => { 
+                    warn!(worker = i, error = %e, port = bind_port, "dht bind failed"); 
+                    return; 
+                } 
+            };
             let target = gen_target(i);
             info!(worker = i, port = bind_port, node_id = %hex::encode(node_id), target = %hex::encode(target), "DHT worker started");
+            
+            let mut attempt = 0u32;
             loop {
+                attempt += 1;
                 let tx2 = tx.clone();
                 let worker_id = i;
                 let wm = worker_metrics.clone();
+                let received_any = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let received_flag = received_any.clone();
+                
                 let on_samples = move |samples: Vec<[u8; 20]>| {
                     let count = samples.len();
                     info!(worker = worker_id, samples = count, "received infohash samples");
                     wm.record_worker_samples(worker_id, count as u64);
+                    received_flag.store(true, Ordering::Relaxed);
                     for ih in samples { let _ = tx2.send(ih); }
                 };
+                
+                info!(worker = i, attempt, bootstrap = ?bootstrap, "starting sample_infohashes request");
                 client.sample_infohashes(&target, &bootstrap, on_samples).await;
+                
+                if !received_any.load(Ordering::Relaxed) {
+                    warn!(worker = i, attempt, "no samples received in this iteration");
+                }
+                
                 sleep(Duration::from_secs(10)).await;
             }
         });
