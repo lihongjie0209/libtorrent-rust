@@ -173,10 +173,7 @@ impl DhtClient {
                         .filter(|addr| addr.is_ipv4())  // Only use IPv4 addresses
                         .take(8)
                         .collect();
-                    if resolved.is_empty() {
-                        tracing::debug!(host = %h, "no IPv4 addresses found, skipping IPv6");
-                    } else {
-                        tracing::debug!(host = %h, resolved = ?resolved, "bootstrap node resolved");
+                    if !resolved.is_empty() {
                         out.extend(resolved);
                     }
                 }
@@ -316,7 +313,6 @@ impl DhtClient {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         // Phase 1: Send find_node to bootstrap nodes to build routing table
         let mut sent_count = 0;
-        let mut find_node_count = 0;
         tracing::info!(bootstrap_count = queue.len(), "starting DHT bootstrap with find_node");
         for _ in 0..queue.len().min(8) {
             if let Some(n) = queue.pop_front() {
@@ -324,10 +320,8 @@ impl DhtClient {
                     let tid = random_tid();
                     let msg = encode_find_node(&tid, &self.node_id, target);
                     match self.sock.send_to(&msg, n).await {
-                        Ok(bytes) => {
-                            find_node_count += 1;
+                        Ok(_) => {
                             sent_count += 1;
-                            tracing::debug!(to = %n, bytes, "sent find_node request");
                         }
                         Err(e) => {
                             tracing::warn!(to = %n, error = %e, "failed to send find_node");
@@ -337,7 +331,6 @@ impl DhtClient {
                 }
             }
         }
-        tracing::debug!(sent = find_node_count, pending = pending.len(), "find_node requests sent");
         
         // Phase 2: Collect node responses for 3 seconds
         let mut nodes_collected = Vec::new();
@@ -347,10 +340,9 @@ impl DhtClient {
         
         while tokio::time::Instant::now() < collect_deadline {
             match timeout(Duration::from_millis(100), self.sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, from))) => {
+                Ok(Ok((n, _from))) => {
                     if n == 0 { continue; }
                     responses_received += 1;
-                    tracing::debug!(from = %from, bytes = n, "received find_node response");
                     let data = &buf[..n];
                     if let Ok(dec) = Decoder::new(data).next_object() {
                         if let Ok(mut dict) = dec.unwrap().try_into_dictionary() {
@@ -389,9 +381,8 @@ impl DhtClient {
             let tid = random_tid();
             let msg = encode_sample_infohashes(&tid, &self.node_id, target);
             match self.sock.send_to(&msg, *addr).await {
-                Ok(bytes) => {
+                Ok(_) => {
                     sent_count += 1;
-                    tracing::debug!(to = %addr, bytes, "sent sample_infohashes request");
                 }
                 Err(e) => {
                     tracing::warn!(to = %addr, error = %e, "failed to send sample_infohashes");
@@ -408,7 +399,6 @@ impl DhtClient {
                 Ok(Ok((n, from))) => {
                     if n == 0 { continue; }
                     responses_received += 1;
-                    tracing::debug!(from = %from, bytes = n, "received DHT response");
                     let data = &buf[..n];
                     if let Ok(dec) = Decoder::new(data).next_object() {
                         if let Ok(mut dict) = dec.unwrap().try_into_dictionary() {
@@ -417,7 +407,6 @@ impl DhtClient {
                             let mut nodes_opt: Option<Vec<u8>> = None;
                             let mut samples_blob: Option<Vec<u8>> = None;
                             let mut interval: Option<i64> = None;
-                            let mut num: Option<i64> = None;
                             let mut error_msg: Option<String> = None;
                             
                             while let Ok(Some((k, v))) = dict.next_pair() {
@@ -442,7 +431,6 @@ impl DhtClient {
                                                     b"nodes" => { if let Ok(b) = rv.try_into_bytes() { nodes_opt = Some(b.to_vec()); } }
                                                     b"samples" => { if let Ok(b) = rv.try_into_bytes() { samples_blob = Some(b.to_vec()); } }
                                                     b"interval" => { if let Ok(i) = rv.try_into_integer() { if let Ok(val) = i.parse::<i64>() { interval = Some(val); } } }
-                                                    b"num" => { if let Ok(i) = rv.try_into_integer() { if let Ok(val) = i.parse::<i64>() { num = Some(val); } } }
                                                     _ => {}
                                                 }
                                             }
@@ -453,15 +441,13 @@ impl DhtClient {
                             }
                             
                             // Handle error responses
-                            if let Some(err) = error_msg {
-                                tracing::debug!(from = %from, error = %err, "received error response");
+                            if let Some(_err) = error_msg {
                                 if let Some(tid) = tid_opt { let _ = pending.remove(&tid); }
                                 continue;
                             }
                             
                             // Validate response has 'id' field (required by BEP 5)
                             if response_id.is_none() || response_id.as_ref().unwrap().len() != 20 {
-                                tracing::debug!(from = %from, "missing or invalid 'id' in response");
                                 continue;
                             }
                             
@@ -470,20 +456,12 @@ impl DhtClient {
                                 // Validate interval (BEP 51: 0 to 21600 seconds)
                                 if let Some(int) = interval {
                                     if int < 0 || int > 21600 {
-                                        tracing::debug!(from = %from, interval = int, "invalid interval value");
                                         continue;
                                     }
-                                    tracing::debug!(from = %from, interval = int, "sample interval received");
-                                }
-                                
-                                // Validate num field
-                                if let Some(n) = num {
-                                    tracing::debug!(from = %from, num = n, "total infohashes count");
                                 }
                                 
                                 // Validate samples length (must be multiple of 20)
                                 if sb.len() % 20 != 0 {
-                                    tracing::debug!(from = %from, len = sb.len(), "invalid samples length");
                                     continue;
                                 }
                             }
@@ -508,9 +486,8 @@ impl DhtClient {
                 if let Some(n) = nodes_collected.pop() {
                     let tid = random_tid();
                     let msg = encode_sample_infohashes(&tid, &self.node_id, target);
-                    if let Ok(bytes) = self.sock.send_to(&msg, n).await {
+                    if let Ok(_) = self.sock.send_to(&msg, n).await {
                         sent_count += 1;
-                        tracing::trace!(to = %n, bytes, "sent follow-up sample_infohashes");
                     }
                     pending.insert(tid.to_vec(), n);
                 } else { break; }
