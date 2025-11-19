@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hex::ToHex;
 use libtorrent::net::dht::DhtClient;
-use tokio::sync::{mpsc, broadcast};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
 use tracing::{info, warn};
 use clap::Parser;
@@ -19,12 +19,6 @@ use std::path::PathBuf;
 struct SpiderConfig {
     #[arg(long, short = 'w', env = "SPIDER_WORKERS", default_value_t = 1000, help = "Number of DHT workers")]
         workers: usize,
-
-    #[arg(long, short = 'm', alias = "meta-conc", env = "SPIDER_META_CONC", default_value_t = 64, help = "Concurrent metadata fetches")]
-        metadata_concurrency: usize,
-
-    #[arg(long, alias = "meta-clients", env = "SPIDER_META_CLIENTS", default_value_t = 20, help = "Number of metadata download clients")]
-        metadata_clients: usize,
 
     #[arg(long, alias = "out", value_name = "DIR", env = "SPIDER_OUT", help = "Directory to store fetched metadata")]
         output_dir: Option<std::path::PathBuf>,
@@ -254,7 +248,7 @@ async fn main() {
     // Parse CLI arguments
     let cfg = SpiderConfig::parse();
 
-    info!(workers = cfg.workers, meta_conc = cfg.metadata_concurrency, meta_clients = cfg.metadata_clients, out = ?cfg.output_dir, "starting spider");
+    info!(workers = cfg.workers, out = ?cfg.output_dir, "starting spider");
 
     // Initialize metrics
     let metrics = Metrics::new();
@@ -336,8 +330,8 @@ async fn main() {
         }
     });
 
-    // Metadata fetchers (broadcast channel for multiple workers)
-    let (tx_meta, rx_meta) = broadcast::channel::<([u8;20], Vec<SocketAddr>)>(1000);
+    // Metadata fetchers
+    let (tx_meta, rx_meta) = mpsc::unbounded_channel::<([u8;20], Vec<SocketAddr>)>();
 
     // Coordinator: collect infohashes, query peers via DHT, enqueue to metadata workers
     let coord_bootstrap = cfg.bootstrap.clone();
@@ -378,34 +372,30 @@ async fn main() {
         }
     });
 
-    // Metadata downloads with fixed worker pool
+    // Metadata downloads without concurrency limit
     let out_dir = cfg.output_dir.clone();
-    let num_clients = cfg.metadata_clients;
     let meta_metrics = metrics.clone();
-    
-    for client_id in 0..num_clients {
-        let mut rx = rx_meta.resubscribe();
-        let out = out_dir.clone();
-        let mm = meta_metrics.clone();
-        
-        tokio::spawn(async move {
-            while let Ok((ih, peers)) = rx.recv().await {
+    tokio::spawn(async move {
+        let mut rx = rx_meta;
+        while let Some((ih, peers)) = rx.recv().await {
+            let out = out_dir.clone();
+            let mm = meta_metrics.clone();
+            tokio::spawn(async move {
                 mm.record_metadata_attempt();
-                info!(client = client_id, ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
+                info!(ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
                 if let Err(e) = fetch_metadata_for_infohash(ih, peers.clone(), out.as_ref(), mm.clone()).await {
-                    warn!(client = client_id, ih = %hex::encode(ih), error = %e, "metadata fetch failed");
+                    warn!(ih = %hex::encode(ih), error = %e, "metadata fetch failed");
                     // simple delayed retry (don't count as new attempt)
                     let out2 = out.clone();
-                    let mm2 = mm.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_secs(30)).await;
                         info!(ih = %hex::encode(ih), "retry metadata fetch");
-                        let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), mm2).await;
+                        let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), Metrics::new()).await;
                     });
                 }
-            }
-        });
-    }
+            });
+        }
+    });
 
     // Periodic metrics reporting
     let report_metrics = metrics.clone();
