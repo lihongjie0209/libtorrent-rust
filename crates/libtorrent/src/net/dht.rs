@@ -161,7 +161,7 @@ impl DhtClient {
                 Ok(iter) => {
                     let resolved: Vec<_> = iter
                         .filter(|addr| addr.is_ipv4())  // Only use IPv4 addresses
-                        .take(4)
+                        .take(8)
                         .collect();
                     if resolved.is_empty() {
                         tracing::debug!(host = %h, "no IPv4 addresses found, skipping IPv6");
@@ -289,6 +289,11 @@ impl DhtClient {
         bootstrap: &[String],
         on_samples: impl Fn(Vec<[u8; 20]>) + Send + 'static,
     ) {
+        // Log socket binding info
+        if let Ok(local) = self.sock.local_addr() {
+            tracing::info!(local_addr = %local, "DHT socket bound");
+        }
+        
         let seeds = Self::resolve_bootstrap(bootstrap).await;
         if seeds.is_empty() { 
             tracing::warn!("failed to resolve any bootstrap nodes");
@@ -301,7 +306,8 @@ impl DhtClient {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         // kick off
         let mut sent_count = 0;
-        for _ in 0..8 {
+        tracing::info!(bootstrap_count = queue.len(), "starting sample_infohashes with bootstrap nodes");
+        for _ in 0..16 {
             if let Some(n) = queue.pop_front() {
                 if seen.insert(n) {
                     let tid = random_tid();
