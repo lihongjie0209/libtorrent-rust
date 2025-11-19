@@ -44,11 +44,29 @@ struct SpiderConfig {
 
     #[arg(long, alias = "dedup-persist-interval", value_name = "SECS", env = "SPIDER_DEDUP_PERSIST_INTERVAL", default_value_t = 300, help = "Interval in seconds to persist deduplication state to disk")]
         dedup_persist_interval: u64,
+
+    #[arg(long, alias = "jsonline", value_name = "FILE", env = "SPIDER_JSONLINE", help = "Path to jsonline output file for metadata results")]
+        jsonline_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DeduplicationState {
     seen_infohashes: HashSet<[u8; 20]>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetadataResult {
+    infohash: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    timestamp: u64,
 }
 
 struct DeduplicationManager {
@@ -374,24 +392,55 @@ async fn main() {
 
     // Metadata downloads without concurrency limit
     let out_dir = cfg.output_dir.clone();
+    let jsonline_path = cfg.jsonline_path.clone();
     let meta_metrics = metrics.clone();
     tokio::spawn(async move {
         let mut rx = rx_meta;
         while let Some((ih, peers)) = rx.recv().await {
             let out = out_dir.clone();
+            let jsonline = jsonline_path.clone();
             let mm = meta_metrics.clone();
             tokio::spawn(async move {
                 mm.record_metadata_attempt();
                 info!(ih = %hex::encode(ih), peers = peers.len(), "metadata fetch start");
-                if let Err(e) = fetch_metadata_for_infohash(ih, peers.clone(), out.as_ref(), mm.clone()).await {
-                    warn!(ih = %hex::encode(ih), error = %e, "metadata fetch failed");
-                    // simple delayed retry (don't count as new attempt)
-                    let out2 = out.clone();
-                    tokio::spawn(async move {
-                        sleep(Duration::from_secs(30)).await;
-                        info!(ih = %hex::encode(ih), "retry metadata fetch");
-                        let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), Metrics::new()).await;
-                    });
+                match fetch_metadata_for_infohash(ih, peers.clone(), out.as_ref(), mm.clone()).await {
+                    Ok(meta) => {
+                        let result = MetadataResult {
+                            infohash: hex::encode(ih),
+                            success: true,
+                            name: Some(meta.info.name.clone()),
+                            size: Some(meta.info.files.iter().map(|f| f.length).sum()),
+                            files: Some(meta.info.files.iter().map(|f| f.path.to_string_lossy().to_string()).collect()),
+                            error: None,
+                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                        };
+                        info!(ih = %hex::encode(ih), name = %meta.info.name, size = result.size.unwrap(), "✓ metadata fetched successfully");
+                        if let Some(path) = jsonline {
+                            let _ = write_jsonline(&path, &result).await;
+                        }
+                    },
+                    Err(e) => {
+                        let result = MetadataResult {
+                            infohash: hex::encode(ih),
+                            success: false,
+                            name: None,
+                            size: None,
+                            files: None,
+                            error: Some(e.to_string()),
+                            timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+                        };
+                        warn!(ih = %hex::encode(ih), error = %e, "✗ metadata fetch failed");
+                        if let Some(path) = jsonline {
+                            let _ = write_jsonline(&path, &result).await;
+                        }
+                        // simple delayed retry (don't count as new attempt)
+                        let out2 = out.clone();
+                        tokio::spawn(async move {
+                            sleep(Duration::from_secs(30)).await;
+                            info!(ih = %hex::encode(ih), "retry metadata fetch");
+                            let _ = fetch_metadata_for_infohash(ih, peers, out2.as_ref(), Metrics::new()).await;
+                        });
+                    }
                 }
             });
         }
@@ -428,7 +477,20 @@ async fn main() {
     }
 }
 
-async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_dir: Option<&std::path::PathBuf>, metrics: Metrics) -> anyhow::Result<()> {
+async fn write_jsonline(path: &PathBuf, result: &MetadataResult) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let json = serde_json::to_string(result)?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(json.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    Ok(())
+}
+
+async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_dir: Option<&std::path::PathBuf>, metrics: Metrics) -> anyhow::Result<libtorrent::metainfo::TorrentMeta> {
     use libtorrent::net::transport;
     use libtorrent::peer::PeerSession;
     use libtorrent::torrent::{TorrentHandle, SharedTorrentHandle};
@@ -489,15 +551,15 @@ async fn fetch_metadata_for_infohash(ih: [u8;20], peers: Vec<SocketAddr>, out_di
         if let Ok(h) = handle.try_read() {
             if !h.meta().info.raw_info_bencode.is_empty() {
                 let data = h.meta().info.raw_info_bencode.clone();
+                let meta = h.meta().clone();
                 metrics.record_bytes_received(data.len() as u64);
                 if let Some(dir) = out_dir { 
                     let fname = dir.join(format!("{}.meta", ih.encode_hex::<String>()));
                     if let Err(e) = tokio::fs::create_dir_all(dir).await { warn!(error = %e, "mkdir failed"); }
                     if let Err(e) = tokio::fs::write(&fname, &data).await { warn!(error = %e, file = %fname.display(), "write failed"); }
                 }
-                info!(ih = %hex::encode(ih), bytes = data.len(), "metadata fetched");
                 metrics.record_metadata_success();
-                return Ok(());
+                return Ok(meta);
             }
         }
     }
